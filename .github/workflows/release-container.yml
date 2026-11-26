@@ -1,26 +1,35 @@
 name: "Build: Release Container"
 
+# oneICT fork (oneictag/CIPP-NG). Replaces the upstream release workflow: builds the image from a
+# release tag on the `oneict` branch (upstream release + oneICT commits) and pushes it to
+# ghcr.io/oneictag/cipp-ng. The file path, the tag ref and the attestation must stay like this:
+# CIPP's built-in container updater (Test-CIPPContainerAttestation) only accepts a :latest image
+# that was built by .github/workflows/release-container.yml from refs/tags/* in the repository
+# named by the image path.
+#
+# Started by oneict-upstream.yml (workflow_dispatch is allowed for GITHUB_TOKEN) or by hand:
+#   gh workflow run release-container.yml --ref v11.4.0+oneict.1 -f promote=false
+# promote=false builds only the version tag (staging); promote=true also moves :latest, which every
+# instance pointing at ghcr.io/oneictag/cipp-ng:latest picks up at its next update check.
+
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: "Also tag :latest (production instances auto-update to it)"
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+
+concurrency:
+  group: release-container
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # `release: [published]` also fires for PRE-releases, and this job moves :latest — the tag
-    # every stable customer follows. Without this guard, ticking "set as a pre-release" in the
-    # GitHub UI would ship that build to the entire estate. Negation form (not `== false`) so a
-    # missing or blank value cannot evaluate truthy.
-    #
-    # Consequence: publishing a pre-release now produces NO image at all. The run still shows in
-    # the Actions tab as *skipped* - that is the signal that nothing shipped. If a release
-    # candidate channel is ever wanted, this is the hook point: build on prerelease, push
-    # :<version> plus a moving :prerelease, and keep :latest behind this same condition.
-    if: ${{ !github.event.release.prerelease }}
     permissions:
       contents: read
       packages: write
@@ -28,32 +37,38 @@ jobs:
       attestations: write
 
     steps:
+      - name: Require a oneICT release tag
+        run: |
+          case "${GITHUB_REF}" in
+            refs/tags/v*+oneict.*) ;;
+            *) echo "::error::Run this on a tag like v11.4.0+oneict.1, not ${GITHUB_REF}"; exit 1 ;;
+          esac
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      # :latest may only be built from a commit that went through the PR gate on main. A release
-      # published from any other tag fails here instead of shipping.
-      - name: Verify tag is on main
+      # Only commits that reached the oneict branch may become an image.
+      - name: Verify tag is on oneict
         run: |
-          git fetch --no-tags origin main
-          git merge-base --is-ancestor HEAD origin/main || {
-            echo "::error::Release tag ${GITHUB_REF_NAME} is not an ancestor of main; refusing to build :latest"
+          git fetch --no-tags origin oneict
+          git merge-base --is-ancestor HEAD origin/oneict || {
+            echo "::error::Tag ${GITHUB_REF_NAME} is not an ancestor of oneict; refusing to build"
             exit 1
           }
 
-      - name: Set lower case image name
-        run: echo "IMAGE_NAME_LC=${REPO,,}" >> $GITHUB_ENV
+      - name: Names and version
+        id: version
         env:
           REPO: ${{ github.repository }}
-
-      - name: Extract version from tag
-        id: version
         run: |
-          # Strip 'v' prefix if present (e.g. v1.2.3 → 1.2.3)
+          # v11.4.0+oneict.3 -> APP_VERSION 11.4.0+oneict.3 (semver build metadata: compares equal to
+          # 11.4.0, so no false "out of date" alerts) and image tag 11.4.0-oneict.3 (no '+' in tags)
           TAG="${GITHUB_REF_NAME#v}"
+          echo "IMAGE_NAME_LC=${REPO,,}" >> $GITHUB_ENV
           echo "app_version=$TAG" >> $GITHUB_OUTPUT
+          echo "image_tag=${TAG//+/-}" >> $GITHUB_OUTPUT
           echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
 
       - name: Log in to GHCR
@@ -67,37 +82,6 @@ jobs:
         id: buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # Persist the Next.js compile cache and yarn cache across runs (BuildKit
-      # cache mounts are not exported by type=gha). Separate key prefix and gha
-      # scope from dev/nightly — release builds a different Dockerfile/base image.
-      # Weekly rotation rather than per-run - see the note in dev-container.yml.
-      - name: Compute cache epoch
-        id: cache-epoch
-        run: echo "week=$(date -u +%Y-%W)" >> $GITHUB_OUTPUT
-
-      - name: Restore frontend build caches
-        id: build-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            yarn-cache
-            next-cache
-          key: cipp-frontend-cache-release-${{ hashFiles('frontend/yarn.lock') }}-${{ steps.cache-epoch.outputs.week }}
-          restore-keys: |
-            cipp-frontend-cache-release-${{ hashFiles('frontend/yarn.lock') }}-
-            cipp-frontend-cache-release-
-
-      - name: Inject build caches into BuildKit
-        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          cache-map: |
-            {
-              "yarn-cache": "/usr/local/share/.cache/yarn",
-              "next-cache": "/build/.next/cache"
-            }
-          skip-extraction: ${{ steps.build-cache.outputs.cache-hit }}
-
       - name: Build and push
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -105,31 +89,36 @@ jobs:
           context: .
           file: build/Dockerfile.release
           push: true
-          cache-from: type=gha,scope=release
-          cache-to: type=gha,mode=max,scope=release
+          cache-from: type=gha,scope=oneict-release
+          cache-to: type=gha,mode=max,scope=oneict-release
           build-args: |
             APP_VERSION=${{ steps.version.outputs.app_version }}
             COMMIT_SHA=${{ github.sha }}
             IMAGE_TAG=latest
             BUILD_DATE=${{ steps.version.outputs.build_date }}
-            DOTNET_REGISTRY=${{ vars.DOTNET_REGISTRY || 'ghcr.io/cyberdrain' }}
-          # :latest is the stable channel every customer follows. Nothing conditional or
-          # experimental should ever be added here - gate it at the job `if` instead.
+            DOTNET_REGISTRY=ghcr.io/cyberdrain
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.app_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.image_tag }}
+            ${{ inputs.promote && format('{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME_LC) || '' }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.description=CIPP - CIPP Next Generation
+            org.opencontainers.image.description=CIPP - CIPP Next Generation (oneICT build)
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.app_version }}
             org.opencontainers.image.created=${{ steps.version.outputs.build_date }}
 
-      # Signs a provenance attestation linking the pushed digest to this workflow run and commit,
-      # so consumers can verify an image came from CI rather than a direct registry push.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.image_tag }}"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- APP_VERSION: ${{ steps.version.outputs.app_version }}"
+            echo "- :latest moved: ${{ inputs.promote }}"
+          } >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,158 @@
+name: "oneICT: Upstream nachziehen und bauen"
+
+# Keeps the oneICT CIPP build current (Item 230 / e3265).
+#   oneict  = latest upstream release tag (CyberDrain/CIPP) + oneICT commits on top.
+# Daily: mirror upstream main, and when CyberDrain publishes a new release, rebase the oneICT commits
+# onto it, run the oneICT tests, tag v<upstream>+oneict.<n> and start release-container.yml.
+# A push to oneict (merged oneICT change) tags and builds the same way.
+# Conflict or failing tests: nothing is pushed or built, production keeps its image; a PR
+# (upstream-update/<tag> -> oneict) and an issue say what to resolve.
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # 04:17/05:17 Swiss time, before CIPP's hourly update check picks up :latest
+  push:
+    branches: [oneict]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: "Move :latest after the build (production follows it)"
+        type: boolean
+        default: true
+      force_build:
+        description: "Build even if nothing changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: oneict-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: CyberDrain/CIPP
+  # Repository variable ONEICT_AUTO_PROMOTE=false stops automatic production updates (build only).
+  AUTO_PROMOTE: ${{ vars.ONEICT_AUTO_PROMOTE || 'true' }}
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: oneict
+          fetch-depth: 0
+
+      - name: Mirror upstream main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh repo sync "${GITHUB_REPOSITORY}" -b main || echo "::warning::main mirror sync failed (not used for builds)"
+
+      - name: Find upstream release and current base
+        id: state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "oneict-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --quiet --tags upstream
+          LATEST=$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)
+          # Current base = newest upstream release tag contained in oneict
+          BASE=$(git tag --merged HEAD --sort=-v:refname 'v*' | grep -v '+oneict' | head -1)
+          LAST_OWN=$(git tag --merged HEAD --sort=-creatordate 'v*+oneict.*' | head -1)
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+          echo "base=$BASE" >> $GITHUB_OUTPUT
+          echo "last_own=$LAST_OWN" >> $GITHUB_OUTPUT
+          echo "Upstream release: $LATEST, oneict base: $BASE, last oneICT tag on branch: $LAST_OWN"
+
+      - name: Rebase oneICT commits onto the new upstream release
+        id: rebase
+        if: steps.state.outputs.latest != steps.state.outputs.base
+        env:
+          LATEST: ${{ steps.state.outputs.latest }}
+          BASE: ${{ steps.state.outputs.base }}
+        run: |
+          git branch backup-before-rebase HEAD
+          if git rebase --onto "$LATEST" "$BASE" oneict; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            git diff --name-only --diff-filter=U > conflicts.txt || true
+            git rebase --abort
+            git checkout -q oneict
+            git reset -q --hard backup-before-rebase
+            echo "ok=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: oneICT tests
+        id: tests
+        if: steps.rebase.outputs.ok != 'false'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path ./backend/Tests/oneICT)) { 'ok=true' >> $env:GITHUB_OUTPUT; return }
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
+          Import-Module Pester -RequiredVersion 5.7.1
+          $c = New-PesterConfiguration
+          $c.Run.Path = './backend/Tests/oneICT'
+          $c.Run.PassThru = $true
+          $c.Output.Verbosity = 'Normal'
+          $r = Invoke-Pester -Configuration $c
+          "ok=$($r.FailedCount -eq 0 -and $r.PassedCount -gt 0)".ToLower() >> $env:GITHUB_OUTPUT
+
+      - name: Report conflict or failing tests (production unchanged)
+        if: steps.rebase.outputs.ok == 'false' || steps.tests.outputs.ok == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.state.outputs.latest }}
+          WHY: ${{ steps.rebase.outputs.ok == 'false' && 'Rebase-Konflikt' || 'oneICT-Tests rot' }}
+        run: |
+          BR="upstream-update/${LATEST}"
+          git push --force origin "refs/tags/${LATEST}^{commit}:refs/heads/${BR}" || true
+          FILES=$( [ -s conflicts.txt ] && sed 's/^/- `/; s/$/`/' conflicts.txt || echo "- (siehe Testlauf)" )
+          BODY=$(printf '%s\n\n%s\n\n%s\n%s\n\n%s\n' \
+            "CyberDrain hat **${LATEST}** veroeffentlicht. Das automatische Nachziehen der oneICT-Anpassungen ist gestoppt: **${WHY}**." \
+            "Produktion laeuft unveraendert auf dem letzten oneICT-Image weiter (es wurde nichts gebaut oder :latest verschoben)." \
+            "Betroffene Dateien:" "${FILES}" \
+            "Loesen: Zweig oneict lokal auf ${LATEST} rebasen (git rebase --onto ${LATEST} <alte Basis> oneict), Konflikte loesen, Tests gruen, push --force-with-lease; danach laeuft dieser Workflow wieder normal. Lauf: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
+          gh pr create --base oneict --head "${BR}" --title "Upstream ${LATEST}: ${WHY}" --body "$BODY" \
+            || gh pr comment "${BR}" --body "$BODY" \
+            || echo "::warning::PR could not be created"
+          gh label create oneict-upstream --color B60205 --force >/dev/null 2>&1 || true
+          gh issue create --title "CIPP-Update ${LATEST} blockiert: ${WHY}" --body "$BODY" --label oneict-upstream \
+            || echo "::warning::issue could not be created"
+          echo "::error::${WHY} for ${LATEST} - see PR/issue"
+          exit 1
+
+      - name: Tag and build
+        if: steps.rebase.outputs.ok != 'false' && steps.tests.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.state.outputs.latest }}
+          REBASED: ${{ steps.rebase.outputs.ok == 'true' }}
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force_build || false }}
+          PROMOTE_INPUT: ${{ inputs.promote }}
+        run: |
+          HEAD_TAG=$(git tag --points-at HEAD 'v*+oneict.*' | head -1)
+          if [ -n "$HEAD_TAG" ] && [ "$REBASED" != "true" ] && [ "$FORCE" != "true" ]; then
+            echo "oneict is already built as $HEAD_TAG - nothing to do"; exit 0
+          fi
+          if [ "$REBASED" = "true" ]; then
+            git push --force-with-lease=oneict:$(git rev-parse backup-before-rebase) origin oneict
+          fi
+          VER="${LATEST#v}"
+          N=$(git tag -l "v${VER}+oneict.*" | sed 's/.*+oneict\.//' | sort -n | tail -1)
+          TAG="v${VER}+oneict.$(( ${N:-0} + 1 ))"
+          git tag -a "$TAG" -m "oneICT build of ${LATEST}"
+          git push origin "refs/tags/$TAG"
+          PROMOTE="$AUTO_PROMOTE"
+          [ "$EVENT" = "workflow_dispatch" ] && PROMOTE="$PROMOTE_INPUT"
+          gh workflow run release-container.yml --ref "$TAG" -f promote="$PROMOTE"
+          echo "### $TAG (promote=$PROMOTE)" >> $GITHUB_STEP_SUMMARY
