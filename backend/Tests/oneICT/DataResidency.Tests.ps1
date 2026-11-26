@@ -73,6 +73,10 @@ Describe 'Update-CIPPDataResidencyMeasurement' {
                     'on.ch' { @(@{ id = 'off'; status = 404 }, @{ id = 'on'; status = 200 }) }
                     'none.ch' { @(@{ id = 'off'; status = 404 }, @{ id = 'on'; status = 404 }) }
                     'denied.ch' { @(@{ id = 'off'; status = 403; body = @{ error = @{ message = 'Forbidden' } } }, @{ id = 'on'; status = 403 }) }
+                    # Real Graph answer for a post the tenant did not get (26.11.2026): 403, not 404
+                    'real-off.ch' { @(@{ id = 'off'; status = 200 }, @{ id = 'on'; status = 403; body = @{ error = @{ code = 'forbidden'; message = '{"error":"Resource doesn\u0027t exist for the tenant. ActivityId: x"}' } } }) }
+                    'real-none.ch' { @(@{ id = 'off'; status = 403; body = @{ error = @{ code = 'forbidden'; message = '{"error":"Resource doesn\u0027t exist for the tenant."}' } } }, @{ id = 'on'; status = 403; body = @{ error = @{ code = 'forbidden'; message = '{"error":"Resource doesn\u0027t exist for the tenant."}' } } }) }
+                    'real-on.ch' { @(@{ id = 'off'; status = 403; body = @{ error = @{ code = 'forbidden'; message = '{"error":"Resource doesn\u0027t exist for the tenant."}' } } }, @{ id = 'on'; status = 200 }) }
                     'half.ch' { @(@{ id = 'off'; status = 429 }, @{ id = 'on'; status = 200 }) }
                     'missing.ch' { @(@{ id = 'on'; status = 200 }) }
                     'de.ch' { @(@{ id = 'off'; status = 200 }, @{ id = 'on'; status = 404 }, @{ id = 'org'; status = 200; body = @{ value = @(@{ countryLetterCode = 'DE' }) } }) }
@@ -92,6 +96,14 @@ Describe 'Update-CIPPDataResidencyMeasurement' {
         ($Result | Where-Object defaultDomainName -EQ 'denied.ch').DefaultState | Should -Be 'Error'
         ($Result | Where-Object defaultDomainName -EQ 'denied.ch').MeasureError | Should -Match '403'
         ($Result | Where-Object defaultDomainName -EQ 'ca.ch').MeasureError | Should -Match 'Conditional Access'
+    }
+
+    It 'reads Graph''s 403 "doesn''t exist for the tenant" as a missing post, any other 403 as an error' {
+        $Result = Update-CIPPDataResidencyMeasurement -Tenants @('real-off', 'real-none', 'real-on', 'denied' | ForEach-Object { New-TestTenant $_ })
+        ($Result | Where-Object defaultDomainName -EQ 'real-off.ch').DefaultState | Should -Be 'Off'
+        ($Result | Where-Object defaultDomainName -EQ 'real-none.ch').DefaultState | Should -Be 'None'
+        ($Result | Where-Object defaultDomainName -EQ 'real-on.ch').DefaultState | Should -Be 'On'
+        ($Result | Where-Object defaultDomainName -EQ 'denied.ch').DefaultState | Should -Be 'Error'
     }
 
     It 'never stores a half-failed batch as on by default' {

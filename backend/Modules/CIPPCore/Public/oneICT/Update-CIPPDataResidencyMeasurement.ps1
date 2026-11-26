@@ -41,8 +41,15 @@ function Update-CIPPDataResidencyMeasurement {
         $Answered = @{}
         foreach ($Response in $TenantResult.Responses) { $Answered[[string]$Response.id] = $Response }
 
+        # Graph answers a post that was not sent to the tenant with 403 "Resource doesn't exist for the tenant"
+        # (measured 26.11.2026), not with 404. Treat both as 'absent' (404); any other 403 stays an error.
         $Status = @{}
-        foreach ($Key in $Posts.Keys) { $Status[$Key] = if ($Answered.ContainsKey($Key)) { [int]$Answered[$Key].status } else { 0 } }
+        foreach ($Key in $Posts.Keys) {
+            $Code = if ($Answered.ContainsKey($Key)) { [int]$Answered[$Key].status } else { 0 }
+            $Text = [string]($Answered[$Key].body.error.message ?? '')
+            if ($Code -eq 403 -and $Text -match 'exist for the tenant') { $Code = 404 }
+            $Status[$Key] = $Code
+        }
         $Country = if ([int]$Answered['org'].status -eq 200) { [string]@($Answered['org'].body.value)[0].countryLetterCode } else { '' }
 
         # Only a complete answer classifies: 200 = post exists, 404 = post absent. Anything else (403, 429, no
