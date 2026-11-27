@@ -18,5 +18,10 @@
     "label": "Message Center",
     "path": "/tenant/administration/service-health/message-center",
     "icon": "NewReleases"
+  },
+  {
+    "label": "Datenresidenz CH",
+    "path": "/tenant/administration/service-health/data-residency",
+    "icon": "Public"
   }
 ]
