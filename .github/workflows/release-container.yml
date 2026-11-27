@@ -1,15 +1,12 @@
 name: "Build: Release Container"
 
 # oneICT fork (oneictag/CIPP-NG). Replaces the upstream release workflow: builds the image from a
-# release tag on the `oneict` branch (upstream release + oneICT commits) and pushes it to
-# ghcr.io/oneictag/cipp-ng. The file path, the tag ref and the attestation must stay like this:
-# CIPP's built-in container updater (Test-CIPPContainerAttestation) only accepts a :latest image
-# that was built by .github/workflows/release-container.yml from refs/tags/* in the repository
-# named by the image path.
+# release tag v<upstream>+oneict.<n> on the `oneict` branch (upstream release + oneICT commits).
+# Keeps the upstream file name so upstream changes to it show up as rebase conflicts, not silently.
 #
 # Started by oneict-upstream.yml (workflow_dispatch is allowed for GITHUB_TOKEN) or by hand:
 #   gh workflow run release-container.yml --ref v11.4.0+oneict.1 -f target=staging
-# The GHCR package stays private (org policy). Images are also pushed to the Azure Container Registry
+# No GHCR package (org policy: no public packages). Images are pushed to the Azure Container Registry
 # vars.ACR_NAME via OIDC (environment "azure", no stored secret); the App Services pull from there
 # with their managed identity. CIPP's own container updater stays inactive for non-GHCR images, so
 # instances only change when this workflow deploys (target=staging|production): pinned by digest,
@@ -41,7 +38,6 @@ jobs:
       image_tag: ${{ steps.version.outputs.image_tag }}
     permissions:
       contents: read
-      packages: write
       id-token: write
       attestations: write
 
@@ -94,13 +90,6 @@ jobs:
           echo "craft_base=ghcr.io/cyberdrain/craft:${CRAFT}" >> $GITHUB_OUTPUT
           echo "Upstream ${UP} was built on Craft ${CRAFT}"
 
-      - name: Log in to GHCR
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Azure login (OIDC)
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
         with:
@@ -132,7 +121,6 @@ jobs:
             DOTNET_REGISTRY=ghcr.io/cyberdrain
             CRAFT_BASE=${{ steps.craft.outputs.craft_base }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.image_tag }}
             ${{ vars.ACR_NAME }}.azurecr.io/cipp-ng:${{ steps.version.outputs.image_tag }}
             ${{ inputs.target == 'production' && format('{0}.azurecr.io/cipp-ng:latest', vars.ACR_NAME) || '' }}
           labels: |
@@ -145,18 +133,17 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
+          subject-name: ${{ vars.ACR_NAME }}.azurecr.io/cipp-ng
           subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+          push-to-registry: false
 
       - name: Summary
         run: |
           {
-            echo "### ${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.image_tag }}"
+            echo "### ${{ vars.ACR_NAME }}.azurecr.io/cipp-ng:${{ steps.version.outputs.image_tag }}"
             echo "- digest: \`${{ steps.build.outputs.digest }}\`"
             echo "- APP_VERSION: ${{ steps.version.outputs.app_version }}"
             echo "- Craft base: ${{ steps.craft.outputs.craft_base }}"
-            echo "- ACR: ${{ vars.ACR_NAME }}.azurecr.io/cipp-ng:${{ steps.version.outputs.image_tag }}"
             echo "- deploy target: ${{ inputs.target }}"
           } >> $GITHUB_STEP_SUMMARY
 
