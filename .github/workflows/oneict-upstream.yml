@@ -65,6 +65,7 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM}.git"
           git fetch --quiet --tags upstream
           LATEST=$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)
+          # gh must never act on the upstream repo: every write below passes -R "$GITHUB_REPOSITORY"
           # Current base = newest upstream release tag contained in oneict
           BASE=$(git tag --merged HEAD --sort=-v:refname 'v*' | grep -v '+oneict' | head -1)
           LAST_OWN=$(git tag --merged HEAD --sort=-creatordate 'v*+oneict.*' | head -1)
@@ -121,11 +122,11 @@ jobs:
             "Produktion laeuft unveraendert auf dem letzten oneICT-Image weiter (es wurde nichts gebaut oder :latest verschoben)." \
             "Betroffene Dateien:" "${FILES}" \
             "Loesen: Zweig oneict lokal auf ${LATEST} rebasen (git rebase --onto ${LATEST} <alte Basis> oneict), Konflikte loesen, Tests gruen, push --force-with-lease; danach laeuft dieser Workflow wieder normal. Lauf: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
-          gh pr create --base oneict --head "${BR}" --title "Upstream ${LATEST}: ${WHY}" --body "$BODY" \
-            || gh pr comment "${BR}" --body "$BODY" \
+          gh pr create -R "$GITHUB_REPOSITORY" --base oneict --head "${BR}" --title "Upstream ${LATEST}: ${WHY}" --body "$BODY" \
+            || gh pr comment -R "$GITHUB_REPOSITORY" "${BR}" --body "$BODY" \
             || echo "::warning::PR could not be created"
-          gh label create oneict-upstream --color B60205 --force >/dev/null 2>&1 || true
-          gh issue create --title "CIPP-Update ${LATEST} blockiert: ${WHY}" --body "$BODY" --label oneict-upstream \
+          gh label create -R "$GITHUB_REPOSITORY" oneict-upstream --color B60205 --force >/dev/null 2>&1 || true
+          gh issue create -R "$GITHUB_REPOSITORY" --title "CIPP-Update ${LATEST} blockiert: ${WHY}" --body "$BODY" --label oneict-upstream \
             || echo "::warning::issue could not be created"
           echo "::error::${WHY} for ${LATEST} - see PR/issue"
           exit 1
@@ -154,5 +155,5 @@ jobs:
           git push origin "refs/tags/$TAG"
           PROMOTE="$AUTO_PROMOTE"
           [ "$EVENT" = "workflow_dispatch" ] && PROMOTE="$PROMOTE_INPUT"
-          gh workflow run release-container.yml --ref "$TAG" -f promote="$PROMOTE"
+          gh workflow run -R "$GITHUB_REPOSITORY" release-container.yml --ref "$TAG" -f promote="$PROMOTE"
           echo "### $TAG (promote=$PROMOTE)" >> $GITHUB_STEP_SUMMARY
