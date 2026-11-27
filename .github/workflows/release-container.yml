@@ -8,17 +8,21 @@ name: "Build: Release Container"
 # named by the image path.
 #
 # Started by oneict-upstream.yml (workflow_dispatch is allowed for GITHUB_TOKEN) or by hand:
-#   gh workflow run release-container.yml --ref v11.4.0+oneict.1 -f promote=false
-# promote=false builds only the version tag (staging); promote=true also moves :latest, which every
-# instance pointing at ghcr.io/oneictag/cipp-ng:latest picks up at its next update check.
+#   gh workflow run release-container.yml --ref v11.4.0+oneict.1 -f target=staging
+# The GHCR package stays private (org policy). Images are also pushed to the Azure Container Registry
+# vars.ACR_NAME via OIDC (environment "azure", no stored secret); the App Services pull from there
+# with their managed identity. CIPP's own container updater stays inactive for non-GHCR images, so
+# instances only change when this workflow deploys (target=staging|production): pinned by digest,
+# health-checked, and rolled back automatically to the previous image if the check fails.
 
 on:
   workflow_dispatch:
     inputs:
-      promote:
-        description: "Also tag :latest (production instances auto-update to it)"
-        type: boolean
-        default: false
+      target:
+        description: "Deploy the built image to: none, staging (STAGING_WEBAPP) or production (PROD_WEBAPP)"
+        type: choice
+        options: [none, staging, production]
+        default: none
 
 env:
   REGISTRY: ghcr.io
@@ -30,6 +34,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    environment: azure
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      app_version: ${{ steps.version.outputs.app_version }}
+      image_tag: ${{ steps.version.outputs.image_tag }}
     permissions:
       contents: read
       packages: write
@@ -71,12 +80,36 @@ jobs:
           echo "image_tag=${TAG//+/-}" >> $GITHUB_OUTPUT
           echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
 
+      # Build on exactly the Craft host CyberDrain shipped with this upstream release. The Dockerfile
+      # defaults to the moving craft:latest, which can be a newer major (26.11.2026: release 11.4.0 shipped
+      # with Craft 1.0.34, craft:latest was already 2.0.0). Never fall back to latest silently.
+      - name: Craft base of the upstream release
+        id: craft
+        env:
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+        run: |
+          UP="${APP_VERSION%%+*}"
+          CRAFT=$(docker buildx imagetools inspect "ghcr.io/cyberdrain/cipp:${UP}" --format '{{json .Image}}'             | python3 -c "import json,sys; d=json.load(sys.stdin); d=d.get('linux/amd64',d); print([e.split('=',1)[1] for e in d['config']['Env'] if e.startswith('CRAFT_VERSION=')][0])")
+          [ -n "$CRAFT" ] || { echo "::error::No CRAFT_VERSION found in ghcr.io/cyberdrain/cipp:${UP}"; exit 1; }
+          echo "craft_base=ghcr.io/cyberdrain/craft:${CRAFT}" >> $GITHUB_OUTPUT
+          echo "Upstream ${UP} was built on Craft ${CRAFT}"
+
       - name: Log in to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: az acr login --name "${{ vars.ACR_NAME }}"
 
       - name: Set up Docker Buildx
         id: buildx
@@ -97,9 +130,11 @@ jobs:
             IMAGE_TAG=latest
             BUILD_DATE=${{ steps.version.outputs.build_date }}
             DOTNET_REGISTRY=ghcr.io/cyberdrain
+            CRAFT_BASE=${{ steps.craft.outputs.craft_base }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.image_tag }}
-            ${{ inputs.promote && format('{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME_LC) || '' }}
+            ${{ vars.ACR_NAME }}.azurecr.io/cipp-ng:${{ steps.version.outputs.image_tag }}
+            ${{ inputs.target == 'production' && format('{0}.azurecr.io/cipp-ng:latest', vars.ACR_NAME) || '' }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.description=CIPP - CIPP Next Generation (oneICT build)
@@ -120,5 +155,67 @@ jobs:
             echo "### ${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.image_tag }}"
             echo "- digest: \`${{ steps.build.outputs.digest }}\`"
             echo "- APP_VERSION: ${{ steps.version.outputs.app_version }}"
-            echo "- :latest moved: ${{ inputs.promote }}"
+            echo "- Craft base: ${{ steps.craft.outputs.craft_base }}"
+            echo "- ACR: ${{ vars.ACR_NAME }}.azurecr.io/cipp-ng:${{ steps.version.outputs.image_tag }}"
+            echo "- deploy target: ${{ inputs.target }}"
           } >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    needs: build
+    if: inputs.target == 'staging' || inputs.target == 'production'
+    runs-on: ubuntu-latest
+    environment: azure
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+    concurrency:
+      group: deploy-${{ inputs.target }}
+      cancel-in-progress: false
+    env:
+      APP: ${{ inputs.target == 'production' && vars.PROD_WEBAPP || vars.STAGING_WEBAPP }}
+      RG: ${{ vars.AZURE_RG }}
+      IMAGE: ${{ vars.ACR_NAME }}.azurecr.io/cipp-ng@${{ needs.build.outputs.digest }}
+      WANT: ${{ needs.build.outputs.app_version }}
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Switch image (pinned by digest)
+        id: switch
+        run: |
+          [ -n "$APP" ] || { echo "::error::No web app configured for ${{ inputs.target }}"; exit 1; }
+          PREV=$(az webapp config show -n "$APP" -g "$RG" --query linuxFxVersion -o tsv)
+          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
+          echo "Previous image of $APP: $PREV (rollback target)" | tee -a "$GITHUB_STEP_SUMMARY"
+          az webapp config set -n "$APP" -g "$RG" --generic-configurations '{"acrUseManagedIdentityCreds": true}' -o none
+          az webapp config set -n "$APP" -g "$RG" --linux-fx-version "DOCKER|$IMAGE" -o none
+          echo "New image of $APP: DOCKER|$IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Health check (version + /api/setup/health)
+        run: |
+          HOST=$(az webapp show -n "$APP" -g "$RG" --query defaultHostName -o tsv)
+          for i in $(seq 1 60); do
+            V=$(curl -fsS --max-time 20 "https://$HOST/version.json" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)
+            H=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$HOST/api/setup/health" || true)
+            echo "try $i: version=$V health=$H"
+            if [ "$V" = "$WANT" ] && [ "$H" = "200" ]; then echo "healthy on $WANT" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
+            sleep 20
+          done
+          echo "::error::$APP did not come up healthy on $WANT within 20 minutes"
+          exit 1
+
+      - name: Roll back to the previous image
+        if: failure() && steps.switch.outputs.prev != ''
+        env:
+          PREV: ${{ steps.switch.outputs.prev }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          az webapp config set -n "$APP" -g "$RG" --linux-fx-version "$PREV" -o none
+          echo "Rolled $APP back to $PREV" | tee -a "$GITHUB_STEP_SUMMARY"
+          gh issue create -R "$GITHUB_REPOSITORY" --title "Deploy $WANT auf $APP fehlgeschlagen - zurueckgerollt" \
+            --body "Health-Check nach dem Wechsel auf $IMAGE nicht gruen. $APP laeuft wieder auf $PREV. Lauf: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true

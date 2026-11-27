@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       promote:
-        description: "Move :latest after the build (production follows it)"
+        description: "Deploy the build to production (health-checked, auto-rollback)"
         type: boolean
         default: true
       force_build:
@@ -38,7 +38,8 @@ concurrency:
 
 env:
   UPSTREAM: CyberDrain/CIPP
-  # Repository variable ONEICT_AUTO_PROMOTE=false stops automatic production updates (build only).
+  # Repository variable ONEICT_AUTO_PROMOTE=true deploys each new build to production (health-checked,
+  # auto-rollback); false = build only, deploy by hand with release-container.yml target=production.
   AUTO_PROMOTE: ${{ vars.ONEICT_AUTO_PROMOTE || 'true' }}
 
 jobs:
@@ -155,5 +156,6 @@ jobs:
           git push origin "refs/tags/$TAG"
           PROMOTE="$AUTO_PROMOTE"
           [ "$EVENT" = "workflow_dispatch" ] && PROMOTE="$PROMOTE_INPUT"
-          gh workflow run -R "$GITHUB_REPOSITORY" release-container.yml --ref "$TAG" -f promote="$PROMOTE"
-          echo "### $TAG (promote=$PROMOTE)" >> $GITHUB_STEP_SUMMARY
+          TARGET=none; [ "$PROMOTE" = "true" ] && TARGET=production
+          gh workflow run -R "$GITHUB_REPOSITORY" release-container.yml --ref "$TAG" -f target="$TARGET"
+          echo "### $TAG (deploy target=$TARGET)" >> $GITHUB_STEP_SUMMARY
